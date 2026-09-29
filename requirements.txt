@@ -1,0 +1,16 @@
+# Environment Variables
+python-dotenv
+
+# OpenAI API Client
+openai
+
+# Image Processing (PIL / Pillow)
+Pillow
+
+# OCR (Optical Character Recognition)
+# Hinweis: Systemseitig muss Tesseract-OCR installiert sein
+pytesseract
+
+# Computer Vision & Arrays
+opencv-python
+numpy

@@ -1,0 +1,12 @@
+../BIP-Blended-intensive-program/.venv/
+__pycache__/
+*.pyc
+
+*.tif
+*.tiff
+*.png
+*.jpg
+*.jpeg
+
+.txt
+.env
