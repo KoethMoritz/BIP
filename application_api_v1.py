@@ -2,6 +2,7 @@ import base64
 import io
 import os
 from pathlib import Path
+import re  # NEU: Zum Bereinigen eventueller <think>-Tags
 import sys
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -144,8 +145,11 @@ with open(output_file_path, "a", encoding="utf-8") as out:
             for page_label, image_base64 in pages:
                 sub_info = f" ({page_label})" if page_label else ""
                 if page_label:
-                    print(f"   -> Analyzing {page_label}...")
+                    print(f"   -> Analyzing {page_label} with reasoning/thinking...")
 
+                # ============================================================
+                # HIER ERFOLGT DIE AKTIVIERUNG DES THINKING-MODUS
+                # ============================================================
                 response = client.chat.completions.create(
                     model=MODEL,
                     messages=[
@@ -162,10 +166,28 @@ with open(output_file_path, "a", encoding="utf-8") as out:
                             ],
                         }
                     ],
-                    temperature=0.1,
+                    # 1. Empfohlene Temperatur für Reasoning (0.6 - 1.0)
+                    temperature=0.6,
+                    # 2. Ausreichend Token-Budget für Gedankengang + Antwort
+                    max_tokens=4096,
+                    # 3. Parameter für vLLM / SGLang / OpenAI-kompatible Server
+                    extra_body={
+                        "enable_thinking": True,
+                        "reasoning_effort": "high",  # "low", "medium", "high" oder "xhigh"
+                        "chat_template_kwargs": {"enable_thinking": True}
+                    },
                 )
 
-                result_text = response.choices[0].message.content.strip()
+                choice_message = response.choices[0].message
+                raw_text = choice_message.content or ""
+
+                # Optional: Gedanken auf der Konsole ausgeben, falls der Server sie separat liefert
+                reasoning = getattr(choice_message, "reasoning_content", None)
+                if reasoning:
+                    print(f"      [Thinking abgeschlossen: ~{len(reasoning.split())} Wörter]")
+
+                # 4. Falls der Server <think>...</think> im Fließtext liefert, filtern wir es hier heraus:
+                result_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
 
                 entry = (
                     f"FILE: {filename}{sub_info}\n"
