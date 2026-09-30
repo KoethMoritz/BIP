@@ -41,7 +41,7 @@ Image.MAX_IMAGE_PIXELS = None  # sehr grosse Scans erlauben
 
 OUTPUT_TXT = "results_ocr_v3.txt"
 OUTPUT_CSV = "results_ocr_v3.csv"
-DEBUG_DIR = "debug_v3"
+DEBUG_DIR = "../debug_v3"
 SAVE_DEBUG = True  # speichert Crops + OCR-Zeilen pro Datei -> zum Fehler-Analysieren
 SUPPORTED_EXTENSIONS = (
     ".tif", ".tiff", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".pdf"
