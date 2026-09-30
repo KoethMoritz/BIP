@@ -1,7 +1,8 @@
 """
-OCR v3 - Schriftfeld-Extraktion fuer Bauplaene (BVG)
+OCR v3 - Schriftfeld-Extraktion fuer Bauplaene (BVG) mit PDF-Unterstuetzung
 
 Aenderungen gegenueber v2:
+  * Unterstuetzung fuer PDF-Dateien (via pypdfium2, seitenweise, 300 DPI)
   * Crop wird in NATIVER Aufloesung ausgeschnitten, erst danach skaliert
   * Mehrstufige Pipeline (Cascade): mehrere Crops / Vorverarbeitungen / PSM-Modi,
     fehlende Felder werden aus spaeteren Durchlaeufen aufgefuellt
@@ -28,6 +29,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pypdfium2 as pdfium
 import pytesseract
 from PIL import Image
 
@@ -41,7 +43,9 @@ OUTPUT_TXT = "results_ocr_v3.txt"
 OUTPUT_CSV = "results_ocr_v3.csv"
 DEBUG_DIR = "debug_v3"
 SAVE_DEBUG = True  # speichert Crops + OCR-Zeilen pro Datei -> zum Fehler-Analysieren
-SUPPORTED_EXTENSIONS = (".tif", ".tiff", ".png", ".jpg", ".jpeg", ".webp", ".bmp")
+SUPPORTED_EXTENSIONS = (
+    ".tif", ".tiff", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".pdf"
+)
 
 OCR_LANG = "deu+eng"
 MIN_WORD_CONF = 30        # Woerter mit geringerer Tesseract-Konfidenz werden verworfen
@@ -68,7 +72,7 @@ FIELDS = ("Title", "Date", "ID", "Scale")
 # Ueblicher Massstaebe (Nenner). Alles andere wird als OCR-Fehler verworfen.
 KNOWN_SCALES = {1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000}
 
-# TODO: an echte BVG-Plannummern anpassen! (Beispiele: S_510_023 / 1234-05-001)
+# BVG-Plannummern Heuristiken (Beispiele: S_510_023 / 1234-05-001)
 ID_PATTERNS = [
     re.compile(r"\b[A-Z]{1,4}[_\-]\d{2,5}(?:[_\-][A-Z0-9]{1,6}){1,4}\b"),
     re.compile(r"\b\d{3,}(?:[_\-/]\d{1,6}){1,4}[A-Z]?\b"),
@@ -87,7 +91,7 @@ LABELS = {
     ],
     "Scale": [r"\bma\S{0,2}stab\b|\bmst\b\.?|\bscale\b"],
 }
-# Weitere Label-Woerter, die einen Wert "abschneiden" (damit wir nicht in die Nachbarzelle lesen)
+
 EXTRA_STOP = (
     r"\bgez(?:eichnet)?\b|\bgepr(?:uef|ü)?(?:t|ft)?\b|\bindex\b|\bblatt\b|\bformat\b"
     r"|bearbeiter|auftraggeber|änderung|aenderung|\bgebäude\b|\bgebaeude\b|\banlage\b"
@@ -140,24 +144,48 @@ def setup_tesseract():
 
 
 # ============================================================
-# BILD LADEN / VORVERARBEITEN
+# BILD / PDF LADEN & VORVERARBEITEN
 # ============================================================
 
-def load_gray(path: str) -> np.ndarray:
-    """Laedt Seite 1 als uint8-Graustufenarray (auch 1-bit- und 16-bit-TIFFs)."""
-    with Image.open(path) as img:
-        img.seek(0)
-        if img.mode.startswith("I"):  # 16/32-bit Graustufen
-            arr = np.array(img).astype(np.float32)
-            lo, hi = float(arr.min()), float(arr.max())
-            arr = (arr - lo) / max(hi - lo, 1.0) * 255.0
-            return arr.astype(np.uint8)
-        return np.array(img.convert("L"))
+def pil_to_gray_array(img: Image.Image) -> np.ndarray:
+    """Konvertiert ein PIL-Image in ein uint8-Graustufenarray."""
+    if img.mode.startswith("I"):  # 16/32-bit Graustufen
+        arr = np.array(img).astype(np.float32)
+        lo, hi = float(arr.min()), float(arr.max())
+        arr = (arr - lo) / max(hi - lo, 1.0) * 255.0
+        return arr.astype(np.uint8)
+    return np.array(img.convert("L"))
+
+
+def load_gray_pages(path: str) -> list[tuple[str, np.ndarray]]:
+    """Laedt Bild- oder PDF-Seiten als uint8-Graustufenarrays.
+    Gibt Liste aus: [(page_suffix, gray_array), ...] zurueck.
+    """
+    ext = Path(path).suffix.lower()
+
+    if ext == ".pdf":
+        pages = []
+        pdf = pdfium.PdfDocument(path)
+        total_pages = len(pdf)
+
+        for page_index in range(total_pages):
+            page = pdf[page_index]
+            # 300 DPI Rendering fuer exakte OCR-Kanten
+            bitmap = page.render(scale=300 / 72)
+            pil_img = bitmap.to_pil()
+            gray = pil_to_gray_array(pil_img)
+            suffix = f"_page{page_index + 1}" if total_pages > 1 else ""
+            pages.append((suffix, gray))
+
+        return pages
+    else:
+        with Image.open(path) as img:
+            img.seek(0)
+            return [("", pil_to_gray_array(img))]
 
 
 def remove_table_lines(gray: np.ndarray) -> np.ndarray:
-    """Entfernt lange horizontale/vertikale Linien (Tabellenraster des Schriftfelds).
-    Annahme: dunkle Schrift auf hellem Papier."""
+    """Entfernt lange horizontale/vertikale Linien (Tabellenraster des Schriftfelds)."""
     binv = cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 35, 15
     )
@@ -179,7 +207,7 @@ def prepare(gray: np.ndarray, crop_name: str, mode: str) -> np.ndarray:
     x0, y0, x1, y1 = CROPS[crop_name]
     # 1) In NATIVER Aufloesung croppen
     crop = np.ascontiguousarray(gray[int(h * y0):int(h * y1), int(w * x0):int(w * x1)])
-    # 2) Erst danach auf sinnvolle Groesse bringen
+    # 2) Erst danach auf Zielgroesse skalieren
     scale = min(TARGET_LONG_SIDE / max(crop.shape), MAX_UPSCALE)
     if abs(scale - 1) > 0.05:
         interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
@@ -187,7 +215,7 @@ def prepare(gray: np.ndarray, crop_name: str, mode: str) -> np.ndarray:
     # 3) Optional Linien entfernen
     if mode == "nolines":
         crop = remove_table_lines(crop)
-    # 4) Kontrast (keine harte Binarisierung - Tesseract macht das selbst besser)
+    # 4) Kontrastverstaerkung per CLAHE
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     return clahe.apply(crop)
 
@@ -286,9 +314,9 @@ def below_of(lines, i):
     out, prev_bottom = [], lab.y1
     for l in cand:
         if l.y0 - prev_bottom > 2.0 * max(lab.h, l.h):
-            break  # zu grosser Abstand -> andere Zelle
+            break
         if STOP_RE.search(l.text):
-            break  # naechstes Label erreicht
+            break
         out.append(l)
         prev_bottom = l.y1
     return out
@@ -410,7 +438,7 @@ def guess_title(lines):
 
 
 # ============================================================
-# FELDER EXTRAHIEREN  (Strength 2 = Label-Treffer, 1 = Fallback)
+# FELDER EXTRAHIEREN (Strength 2 = Label-Treffer, 1 = Fallback)
 # ============================================================
 
 def extract_fields(lines) -> dict:
@@ -428,7 +456,7 @@ def extract_fields(lines) -> dict:
         res["Date"] = (2, v)
     else:
         dates = parse_dates(text)
-        if dates:  # Fallback: juengstes Datum (Revisionstabelle!)
+        if dates:
             res["Date"] = (1, max(dates, key=lambda d: d[0])[1])
 
     v = find_labeled(lines, "ID", parse_id)
@@ -453,11 +481,10 @@ def extract_fields(lines) -> dict:
 
 
 # ============================================================
-# PRO DATEI
+# VERARBEITUNG EINES GRAUSTUFEN-ARRAYS (EINZELNE SEITE)
 # ============================================================
 
-def process_file(path: str, stem: str, debug_dir: Path):
-    gray = load_gray(path)
+def process_single_gray_image(gray: np.ndarray, stem: str, debug_dir: Path):
     best, passes_run = {}, 0
     for n, (crop_name, mode, psm) in enumerate(PASSES, start=1):
         img = prepare(gray, crop_name, mode)
@@ -493,40 +520,59 @@ def main():
     if SAVE_DEBUG:
         debug_dir.mkdir(exist_ok=True)
 
-    folder = input("Enter the path to the folder with images: ").strip().strip('"\'')
+    folder = input("Enter the path to the folder with files (images/PDFs): ").strip().strip('"\'')
     if not os.path.isdir(folder):
         sys.exit(f"Error: Folder does not exist -> {folder}")
 
     files = [f for f in sorted(os.listdir(folder)) if f.lower().endswith(SUPPORTED_EXTENSIONS)]
     if not files:
-        sys.exit(f"No compatible images found in: {folder}")
+        sys.exit(f"No compatible files found in: {folder}")
 
-    print(f"\nFound {len(files)} images. Starting OCR v3...")
+    print(f"\nFound {len(files)} files. Starting OCR v3...")
     print(f"Results: {txt_path}\n")
 
-    # "w": jede Ausfuehrung ueberschreibt -> keine vermischten Laeufe
     with open(txt_path, "w", encoding="utf-8") as out, \
          open(csv_path, "w", newline="", encoding="utf-8-sig") as fcsv:
         writer = csv.writer(fcsv)
         writer.writerow(["file", "title", "date", "id", "scale", "passes_used", "seconds"])
 
         for idx, filename in enumerate(files, start=1):
+            file_path = os.path.join(folder, filename)
+            base_stem = Path(filename).stem
             print(f"[{idx}/{len(files)}] Processing: {filename}...")
-            t0 = time.perf_counter()
+
             try:
-                r, passes = process_file(os.path.join(folder, filename), Path(filename).stem, debug_dir)
-                result_text = "\n".join(f"{k}: {r[k]}" for k in FIELDS)
-                writer.writerow([filename, r["Title"], r["Date"], r["ID"], r["Scale"],
-                                 passes, f"{time.perf_counter() - t0:.1f}"])
+                pages = load_gray_pages(file_path)
+
+                for page_suffix, gray_array in pages:
+                    t0 = time.perf_counter()
+                    item_display = f"{filename}{page_suffix}"
+                    tag_stem = f"{base_stem}{page_suffix}"
+
+                    if page_suffix:
+                        print(f"   -> Analyzing page {page_suffix.replace('_page', '')}...")
+
+                    r, passes = process_single_gray_image(gray_array, tag_stem, debug_dir)
+                    elapsed = time.perf_counter() - t0
+
+                    result_text = "\n".join(f"{k}: {r[k]}" for k in FIELDS)
+                    writer.writerow([
+                        item_display, r["Title"], r["Date"], r["ID"], r["Scale"],
+                        passes, f"{elapsed:.1f}"
+                    ])
+
+                    out.write(f"FILE: {item_display}\n{'-' * 40}\n{result_text}\n{'=' * 60}\n\n")
+                    out.flush()
+                    fcsv.flush()
+                    print(f"   -> Done {item_display} ({elapsed:.1f}s).")
+
             except Exception as e:
                 result_text = f"Error processing file: {e}"
                 writer.writerow([filename, "", "", "", "", "ERROR", str(e)])
+                out.write(f"FILE: {filename}\n{'-' * 40}\n{result_text}\n{'=' * 60}\n\n")
+                out.flush()
+                fcsv.flush()
                 print(f"   -> Failed: {e}")
-
-            out.write(f"FILE: {filename}\n{'-' * 40}\n{result_text}\n{'=' * 60}\n\n")
-            out.flush()
-            fcsv.flush()
-            print(f"   -> Done ({time.perf_counter() - t0:.1f}s).")
 
     print(f"\nFinished! See '{txt_path}' and '{csv_path}'.")
 

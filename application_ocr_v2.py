@@ -7,6 +7,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PIL import Image
+import pypdfium2 as pdfium
 import pytesseract
 
 # Prevent DecompressionBombWarning for very large scanned files
@@ -17,7 +18,9 @@ Image.MAX_IMAGE_PIXELS = None
 # ============================================================
 
 OUTPUT_FILE = "results_ocr_v2.txt"
-SUPPORTED_EXTENSIONS = (".tif", ".tiff", ".png", ".jpg", ".jpeg", ".webp", ".bmp")
+SUPPORTED_EXTENSIONS = (
+    ".tif", ".tiff", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".pdf"
+)
 
 # Fokusbereich: Untere rechte Ecke (Schriftfeld nach DIN EN ISO 7200)
 FOCUS_BOTTOM_RIGHT = True
@@ -58,7 +61,6 @@ output_file_path = script_dir / OUTPUT_FILE
 
 def preprocess_for_ocr(pil_img: Image.Image) -> np.ndarray:
     """Bereitet den Scan für technische OCR auf:
-
     Graustufen -> Kontrastverstärkung (CLAHE) -> Binarisierung.
     """
     img = np.array(pil_img)
@@ -70,7 +72,6 @@ def preprocess_for_ocr(pil_img: Image.Image) -> np.ndarray:
         gray = img
 
     # 2. CLAHE (Contrast Limited Adaptive Histogram Equalization)
-    # Hebt verblasste Schriften hervor, ohne Hintergrundflecken zu überzeichnen
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
 
@@ -95,24 +96,23 @@ def extract_metadata_v2(raw_text: str) -> dict:
 
     lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
 
-    # 1. Scale: Erfasst auch Varianten wie "M 1 : 100", "1:50/100", "1/4\"=1'0\""
+    # 1. Scale
     scale_pattern = re.compile(
         r"(?:(?:M|Mst|Maßstab|Scale)\s*[:\.]?\s*)?(1\s*:\s*\d{1,4}(?:/\d{1,4})?|1/\d+[\"']?\s*=\s*\d+)",
         re.IGNORECASE,
     )
 
-    # 2. Date: Erkennt TT.MM.JJJJ, TT.MM.JJ, YYYY-MM-DD und "gez. 12.04.22"
+    # 2. Date
     date_pattern = re.compile(
         r"(?:(?:Datum|Date|gez|gepr)\.?\s*[:\.]?\s*)?(\b\d{1,2}[\.\/\-]\d{1,2}[\.\/\-]\d{2,4}\b|\b\d{4}[\.\/\-]\d{2}[\.\/\-]\d{2}\b)",
         re.IGNORECASE,
     )
 
-    # 3. ID / Plannummer: DIN-typische Kennungen mit Bindestrichen/Unterstrichen
+    # 3. ID / Plannummer
     id_label_pattern = re.compile(
         r"(?:plan(?:-|\s*)?nr\.?|zeichnungs(?:-|\s*)?nr\.?|dok(?:ument)?(?:-|\s*)?nr\.?|drawing\s*no\.?|id|code|blatt-?nr\.?)\s*[:\.]?\s*([A-Z0-9\-_./]+)",
         re.IGNORECASE,
     )
-    # Standalone-Plan-ID Heuristik (z. B. S_510_023 oder P-102-A)
     standalone_id_pattern = re.compile(r"\b([A-Z]{1,3}[_\-]\d{2,4}[_\-][A-Z0-9]+)\b")
 
     # 4. Title Keywords
@@ -168,33 +168,56 @@ def extract_metadata_v2(raw_text: str) -> dict:
     return metadata
 
 
-def process_image_v2(file_path: str, max_dimension: int = 3500) -> str:
-    with Image.open(file_path) as img:
-        if img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
+def process_pil_image_ocr(img: Image.Image, max_dimension: int = 3500) -> str:
+    """Schneidet das Schriftfeld zu, skaliert, führt Vorverarbeitung und OCR aus."""
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
 
-        if FOCUS_BOTTOM_RIGHT:
-            w, h = img.size
-            img = img.crop((int(w * 0.50), int(h * 0.60), w, h))
+    if FOCUS_BOTTOM_RIGHT:
+        w, h = img.size
+        img = img.crop((int(w * 0.50), int(h * 0.60), w, h))
 
-        if max(img.size) > max_dimension:
-            img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+    if max(img.size) > max_dimension:
+        img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
 
-        # Vorverarbeitung durch OpenCV
-        processed_cv_img = preprocess_for_ocr(img)
+    processed_cv_img = preprocess_for_ocr(img)
 
-        # Tesseract OCR mit angepassten Parametern
-        text = pytesseract.image_to_string(
-            processed_cv_img, lang="deu+eng", config=TESSERACT_CONFIG
-        )
-        return text
+    return pytesseract.image_to_string(
+        processed_cv_img, lang="deu+eng", config=TESSERACT_CONFIG
+    )
+
+
+def extract_texts_from_file_v2(file_path: str, max_dimension: int = 3500) -> list[tuple[str, str]]:
+    """Lädt Bilder oder PDFs und gibt eine Liste von (Seitenlabel, OCR-Text) zurück."""
+    ext = Path(file_path).suffix.lower()
+
+    if ext == ".pdf":
+        results = []
+        pdf = pdfium.PdfDocument(file_path)
+        total_pages = len(pdf)
+
+        for page_index in range(total_pages):
+            page = pdf[page_index]
+            # 300 DPI Rendering für exakte Texterkennung
+            bitmap = page.render(scale=300 / 72)
+            pil_image = bitmap.to_pil()
+
+            raw_text = process_pil_image_ocr(pil_image, max_dimension=max_dimension)
+            label = f"Page {page_index + 1}/{total_pages}" if total_pages > 1 else ""
+            results.append((label, raw_text))
+
+        return results
+    else:
+        with Image.open(file_path) as img:
+            raw_text = process_pil_image_ocr(img, max_dimension=max_dimension)
+            return [("", raw_text)]
 
 
 # ============================================================
 # MAIN BATCH PROCESSING LOOP
 # ============================================================
 
-folder_path = input("Enter the path to the folder with images: ").strip().strip('"\'')
+folder_path = input("Enter the path to the folder with files (images/PDFs): ").strip().strip('"\'')
 
 if not os.path.isdir(folder_path):
     print(f"Error: Folder does not exist -> {folder_path}")
@@ -206,10 +229,10 @@ all_files = [
 ]
 
 if not all_files:
-    print(f"No compatible images found in: {folder_path}")
+    print(f"No compatible files found in: {folder_path}")
     sys.exit(0)
 
-print(f"\nFound {len(all_files)} images. Starting application_ocr_v2...")
+print(f"\nFound {len(all_files)} files. Starting application_ocr_v2...")
 print(f"Results will be written to: {output_file_path}\n")
 
 with open(output_file_path, "a", encoding="utf-8") as out:
@@ -218,28 +241,44 @@ with open(output_file_path, "a", encoding="utf-8") as out:
         print(f"[{index}/{len(all_files)}] Processing: {filename}...")
 
         try:
-            raw_text = process_image_v2(file_path)
-            metadata = extract_metadata_v2(raw_text)
+            pages = extract_texts_from_file_v2(file_path)
 
-            result_text = (
-                f"Title: {metadata['Title']}\n"
-                f"Date: {metadata['Date']}\n"
-                f"ID: {metadata['ID']}\n"
-                f"Scale: {metadata['Scale']}"
-            )
+            for page_label, raw_text in pages:
+                sub_info = f" ({page_label})" if page_label else ""
+                if page_label:
+                    print(f"   -> OCR on {page_label}...")
+
+                metadata = extract_metadata_v2(raw_text)
+
+                result_text = (
+                    f"Title: {metadata['Title']}\n"
+                    f"Date: {metadata['Date']}\n"
+                    f"ID: {metadata['ID']}\n"
+                    f"Scale: {metadata['Scale']}"
+                )
+
+                entry = (
+                    f"FILE: {filename}{sub_info}\n"
+                    f"{'-' * 40}\n"
+                    f"{result_text}\n"
+                    f"{'=' * 60}\n\n"
+                )
+
+                out.write(entry)
+                out.flush()
+
         except Exception as e:
             result_text = f"Error processing file: {str(e)}"
             print(f"   -> Failed: {e}")
+            entry = (
+                f"FILE: {filename}\n"
+                f"{'-' * 40}\n"
+                f"{result_text}\n"
+                f"{'=' * 60}\n\n"
+            )
+            out.write(entry)
+            out.flush()
 
-        entry = (
-            f"FILE: {filename}\n"
-            f"{'-' * 40}\n"
-            f"{result_text}\n"
-            f"{'=' * 60}\n\n"
-        )
-
-        out.write(entry)
-        out.flush()
         print("   -> Done.")
 
 print(f"\nBatch processing finished successfully! Check '{output_file_path}'.")

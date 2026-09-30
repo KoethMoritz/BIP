@@ -11,3 +11,4 @@ __pycache__/
 .txt
 .env
 .csv
+.ds_Store

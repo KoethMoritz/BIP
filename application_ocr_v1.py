@@ -5,6 +5,7 @@ import shutil
 import sys
 from pathlib import Path
 from PIL import Image
+import pypdfium2 as pdfium
 import pytesseract
 
 # Prevent DecompressionBombWarning for very large scanned files
@@ -15,7 +16,9 @@ Image.MAX_IMAGE_PIXELS = None
 # ============================================================
 
 OUTPUT_FILE = "results_ocr_v1.txt"
-SUPPORTED_EXTENSIONS = (".tif", ".tiff", ".png", ".jpg", ".jpeg", ".webp", ".bmp")
+SUPPORTED_EXTENSIONS = (
+    ".tif", ".tiff", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".pdf"
+)
 
 # Bauplan-Schriftfelder liegen standardmäßig unten rechts.
 # Schneidet die unteren 35% und rechten 45% aus -> spart massiv Zeit bei A0/A1 Plänen.
@@ -139,31 +142,57 @@ def extract_metadata(raw_text: str) -> dict:
     return metadata
 
 
-def process_image(file_path: str, max_dimension: int = 3000) -> str:
-    """Lädt das Bild, schneidet bei Bedarf den Plankopf aus und führt OCR aus."""
-    with Image.open(file_path) as img:
-        if img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
+def process_pil_image_ocr(img: Image.Image, max_dimension: int = 3000) -> str:
+    """Schneidet bei Bedarf den Plankopf aus, skaliert und führt OCR aus."""
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
 
-        # Plankopf-Fokus (unten rechts)
-        if FOCUS_BOTTOM_RIGHT:
-            w, h = img.size
-            img = img.crop((int(w * 0.55), int(h * 0.65), w, h))
+    # Plankopf-Fokus (unten rechts)
+    if FOCUS_BOTTOM_RIGHT:
+        w, h = img.size
+        img = img.crop((int(w * 0.55), int(h * 0.65), w, h))
 
-        # Skalieren auf max. Dimension zur Performance-Optimierung
-        if max(img.size) > max_dimension:
-            img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+    # Skalieren auf max. Dimension zur Performance-Optimierung
+    if max(img.size) > max_dimension:
+        img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
 
-        # Tesseract-OCR mit Deutsch und Englisch ausführen
-        text = pytesseract.image_to_string(img, lang="deu+eng")
-        return text
+    # Tesseract-OCR mit Deutsch und Englisch ausführen
+    return pytesseract.image_to_string(img, lang="deu+eng")
+
+
+def extract_texts_from_file(file_path: str, max_dimension: int = 3000) -> list[tuple[str, str]]:
+    """Lädt Bild- oder PDF-Dateien und liefert eine Liste aus:
+    (Seiten-Label, OCR-Rohtext).
+    """
+    ext = Path(file_path).suffix.lower()
+
+    if ext == ".pdf":
+        results = []
+        pdf = pdfium.PdfDocument(file_path)
+        total_pages = len(pdf)
+
+        for page_index in range(total_pages):
+            page = pdf[page_index]
+            # 300 DPI Rendering (300 / 72 ≈ 4.166) liefert optimale Schärfe für OCR
+            bitmap = page.render(scale=300 / 72)
+            pil_image = bitmap.to_pil()
+
+            raw_text = process_pil_image_ocr(pil_image, max_dimension=max_dimension)
+            label = f"Page {page_index + 1}/{total_pages}" if total_pages > 1 else ""
+            results.append((label, raw_text))
+
+        return results
+    else:
+        with Image.open(file_path) as img:
+            raw_text = process_pil_image_ocr(img, max_dimension=max_dimension)
+            return [("", raw_text)]
 
 
 # ============================================================
 # MAIN BATCH PROCESSING LOOP
 # ============================================================
 
-folder_path = input("Enter the path to the folder with images: ").strip().strip('"\'')
+folder_path = input("Enter the path to the folder with files (images/PDFs): ").strip().strip('"\'')
 
 if not os.path.isdir(folder_path):
     print(f"Error: Folder does not exist -> {folder_path}")
@@ -175,10 +204,10 @@ all_files = [
 ]
 
 if not all_files:
-    print(f"No compatible images found in: {folder_path}")
+    print(f"No compatible files found in: {folder_path}")
     sys.exit(0)
 
-print(f"\nFound {len(all_files)} images. Starting local OCR processing...")
+print(f"\nFound {len(all_files)} files. Starting local OCR processing...")
 print(f"Results will be written to: {output_file_path}\n")
 
 with open(output_file_path, "a", encoding="utf-8") as out:
@@ -187,28 +216,44 @@ with open(output_file_path, "a", encoding="utf-8") as out:
         print(f"[{index}/{len(all_files)}] Processing: {filename}...")
 
         try:
-            raw_text = process_image(file_path)
-            metadata = extract_metadata(raw_text)
+            page_results = extract_texts_from_file(file_path)
 
-            result_text = (
-                f"Title: {metadata['Title']}\n"
-                f"Date: {metadata['Date']}\n"
-                f"ID: {metadata['ID']}\n"
-                f"Scale: {metadata['Scale']}"
-            )
+            for page_label, raw_text in page_results:
+                sub_info = f" ({page_label})" if page_label else ""
+                if page_label:
+                    print(f"   -> OCR on {page_label}...")
+
+                metadata = extract_metadata(raw_text)
+
+                result_text = (
+                    f"Title: {metadata['Title']}\n"
+                    f"Date: {metadata['Date']}\n"
+                    f"ID: {metadata['ID']}\n"
+                    f"Scale: {metadata['Scale']}"
+                )
+
+                entry = (
+                    f"FILE: {filename}{sub_info}\n"
+                    f"{'-' * 40}\n"
+                    f"{result_text}\n"
+                    f"{'=' * 60}\n\n"
+                )
+
+                out.write(entry)
+                out.flush()
+
         except Exception as e:
             result_text = f"Error processing file: {str(e)}"
             print(f"   -> Failed: {e}")
+            entry = (
+                f"FILE: {filename}\n"
+                f"{'-' * 40}\n"
+                f"{result_text}\n"
+                f"{'=' * 60}\n\n"
+            )
+            out.write(entry)
+            out.flush()
 
-        entry = (
-            f"FILE: {filename}\n"
-            f"{'-' * 40}\n"
-            f"{result_text}\n"
-            f"{'=' * 60}\n\n"
-        )
-
-        out.write(entry)
-        out.flush()
         print("   -> Done.")
 
 print(f"\nBatch processing finished successfully! Check '{output_file_path}'.")

@@ -6,6 +6,7 @@ import sys
 from dotenv import load_dotenv
 from openai import OpenAI
 from PIL import Image
+import pypdfium2 as pdfium
 
 # Prevent DecompressionBombWarning for very large scanned files
 Image.MAX_IMAGE_PIXELS = None
@@ -15,13 +16,14 @@ Image.MAX_IMAGE_PIXELS = None
 # ============================================================
 
 OUTPUT_FILE = "results_api.txt"
-SUPPORTED_EXTENSIONS = (".tif", ".tiff", ".png", ".jpg", ".jpeg", ".webp", ".bmp")
+SUPPORTED_EXTENSIONS = (
+    ".tif", ".tiff", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".pdf"
+)
 
 # ============================================================
 # LOAD ENVIRONMENT VARIABLES
 # ============================================================
 
-# Ensures .env is found in the same folder as this script, regardless of where terminal runs
 script_dir = Path(__file__).resolve().parent
 env_path = script_dir / ".env"
 load_dotenv(dotenv_path=env_path)
@@ -65,28 +67,53 @@ Scale: <value>
 Do not include any conversational opening or closing text."""
 
 
-def process_image_to_base64(file_path: str, max_dimension: int = 2048) -> str:
-    """Opens any image format (including multi-MB TIFFs), scales it down in-memory,
+def pil_image_to_base64(img: Image.Image, max_dimension: int = 2048) -> str:
+    """Scales down a PIL Image in-memory and returns a compact Base64 JPEG string."""
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
 
-    and returns a compact Base64 JPEG string.
+    if max(img.size) > max_dimension:
+        img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+
+    buffer = io.BytesIO()
+    img.save(buffer, format="JPEG", quality=85)
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+def load_file_as_base64_list(file_path: str, max_dimension: int = 2048) -> list[tuple[str, str]]:
+    """Loads an image or PDF. 
+    
+    Returns a list of tuples: (page_label, base64_jpeg_string).
     """
-    with Image.open(file_path) as img:
-        if img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
+    ext = Path(file_path).suffix.lower()
 
-        if max(img.size) > max_dimension:
-            img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+    if ext == ".pdf":
+        images = []
+        pdf = pdfium.PdfDocument(file_path)
+        total_pages = len(pdf)
 
-        buffer = io.BytesIO()
-        img.save(buffer, format="JPEG", quality=85)
-        return base64.b64encode(buffer.getvalue()).decode("utf-8")
+        for page_index in range(total_pages):
+            page = pdf[page_index]
+            # Render page at 200 DPI (scale ~2.77) for good readability of title blocks
+            bitmap = page.render(scale=200 / 72)
+            pil_image = bitmap.to_pil()
+            b64_str = pil_image_to_base64(pil_image, max_dimension=max_dimension)
+            
+            label = f"Page {page_index + 1}/{total_pages}" if total_pages > 1 else ""
+            images.append((label, b64_str))
+            
+        return images
+    else:
+        # Standard image files
+        with Image.open(file_path) as img:
+            return [("", pil_image_to_base64(img, max_dimension=max_dimension))]
 
 
 # ============================================================
 # MAIN BATCH PROCESSING LOOP
 # ============================================================
 
-folder_path = input("Enter the path to the folder with images: ").strip().strip('"\'')
+folder_path = input("Enter the path to the folder with files (images/PDF): ").strip().strip('"\'')
 
 if not os.path.isdir(folder_path):
     print(f"Error: Folder does not exist -> {folder_path}")
@@ -98,13 +125,12 @@ all_files = [
 ]
 
 if not all_files:
-    print(f"No compatible images found in: {folder_path}")
+    print(f"No compatible files found in: {folder_path}")
     sys.exit(0)
 
-# Store results in the script's directory
 output_file_path = script_dir / OUTPUT_FILE
 
-print(f"\nFound {len(all_files)} images. Starting batch processing...")
+print(f"\nFound {len(all_files)} files. Starting batch processing...")
 print(f"Results will be written to: {output_file_path}\n")
 
 with open(output_file_path, "a", encoding="utf-8") as out:
@@ -113,42 +139,54 @@ with open(output_file_path, "a", encoding="utf-8") as out:
         print(f"[{index}/{len(all_files)}] Processing: {filename}...")
 
         try:
-            image_base64 = process_image_to_base64(file_path)
+            pages = load_file_as_base64_list(file_path)
 
-            response = client.chat.completions.create(
-                model=MODEL,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": PROMPT},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{image_base64}"
+            for page_label, image_base64 in pages:
+                sub_info = f" ({page_label})" if page_label else ""
+                if page_label:
+                    print(f"   -> Analyzing {page_label}...")
+
+                response = client.chat.completions.create(
+                    model=MODEL,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": PROMPT},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{image_base64}"
+                                    },
                                 },
-                            },
-                        ],
-                    }
-                ],
-                temperature=0.1,
-            )
+                            ],
+                        }
+                    ],
+                    temperature=0.1,
+                )
 
-            result_text = response.choices[0].message.content.strip()
+                result_text = response.choices[0].message.content.strip()
+
+                entry = (
+                    f"FILE: {filename}{sub_info}\n"
+                    f"{'-' * 40}\n"
+                    f"{result_text}\n"
+                    f"{'=' * 60}\n\n"
+                )
+                out.write(entry)
+                out.flush()
 
         except Exception as e:
             result_text = f"Error processing file: {str(e)}"
             print(f"   -> Failed: {e}")
-
-        entry = (
-            f"FILE: {filename}\n"
-            f"{'-' * 40}\n"
-            f"{result_text}\n"
-            f"{'=' * 60}\n\n"
-        )
-
-        out.write(entry)
-        out.flush()
+            entry = (
+                f"FILE: {filename}\n"
+                f"{'-' * 40}\n"
+                f"{result_text}\n"
+                f"{'=' * 60}\n\n"
+            )
+            out.write(entry)
+            out.flush()
 
         print(f"   -> Done.")
 
