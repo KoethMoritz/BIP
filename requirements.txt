@@ -1,16 +1,25 @@
-# Environment Variables
+# Environment Variables (.env with HTW_API_KEY, HTW_BASE_URL, MODEL_NAME)
 python-dotenv
 
-# OpenAI API Client
+# OpenAI-compatible API client (University API + local Ollama)
 openai
 
 # Image Processing (PIL / Pillow)
 Pillow
 
+# PDF rendering
+# pypdfium2: used by application_api_v1.py / application_llm_v1.py
+# pdf2image: used by application_ocr_v4.py (requires Poppler on the system, e.g. `brew install poppler`)
+pypdfium2
+pdf2image
+
 # OCR (Optical Character Recognition)
-# Hinweis: Systemseitig muss Tesseract-OCR installiert sein
+# Note: Tesseract-OCR must be installed on the system (incl. deu + Fraktur language data)
 pytesseract
 
 # Computer Vision & Arrays
 opencv-python
 numpy
+
+# Reading the ground truth as .xlsx (evaluate_results.py)
+openpyxl
